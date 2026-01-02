@@ -1,0 +1,17 @@
+server:
+  host: "0.0.0.0"
+  port: 8765
+  auth_token: "change-me-in-production"
+
+home_assistant:
+  host: "homeassistant.local"
+  port: 10700  # Wyoming protocol default port
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_duration_ms: 30
+
+logging:
+  level: "INFO"
+  file: "hybrid-satellite.log"
