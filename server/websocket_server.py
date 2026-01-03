@@ -7,7 +7,7 @@ import logging
 import websockets
 from typing import Set
 from audio_buffer import AudioBuffer
-from wyoming_client import WyomingClient
+from wyoming_server import WyomingServer
 
 logger = logging.getLogger(__name__)
 
@@ -17,22 +17,92 @@ class WebSocketServer:
     WebSocket server handling browser connections and audio streaming.
     """
     
-    def __init__(self, host: str, port: int, wyoming_client: WyomingClient, auth_token: str = None):
+    def __init__(self, host: str, port: int, wyoming_server: WyomingServer, auth_token: str = None, ssl_context=None):
         """
         Initialize WebSocket server.
         
         Args:
             host: Server host address
             port: Server port
-            wyoming_client: Wyoming client instance
+            wyoming_server: Wyoming Server instance
             auth_token: Optional authentication token
+            ssl_context: Optional SSL context for WSS
         """
         self.host = host
         self.port = port
-        self.wyoming_client = wyoming_client
+        self.wyoming_server = wyoming_server
         self.auth_token = auth_token
+        self.ssl_context = ssl_context
         self.clients: Set[websockets.WebSocketServerProtocol] = set()
         self.audio_buffer = AudioBuffer(sample_rate=16000)
+        
+        # Register TTS callback
+        self.wyoming_server.on_tts_audio = self.broadcast_audio
+    
+    async def start(self):
+        """Start the WebSocket server."""
+        self.server = await websockets.serve(
+            self.handler, 
+            self.host, 
+            self.port,
+            ssl=self.ssl_context,
+            process_request=self.process_request
+        )
+        protocol = "wss" if self.ssl_context else "ws"
+        logger.info(f"WebSocket server running on {protocol}://{self.host}:{self.port}")
+        logger.info(f"Client available at https://{self.host}:{self.port}/")
+
+    async def process_request(self, path, request_headers):
+        """
+        Handle HTTP requests to serve static client files.
+        This allows serving the client on the same port as the WebSocket,
+        resolving mixed content and SSL trust issues.
+        """
+        try:
+            logger.debug(f"Handling HTTP request for path: {path}")
+            
+            if path == '/':
+                path = '/index.html'
+            
+            # Allow WebSocket upgrades to pass through
+            if "Upgrade" in request_headers and request_headers["Upgrade"].lower() == "websocket":
+                return None
+            
+            # Simple security check
+            if '..' in path:
+                return (403, [], b'403 Forbidden')
+            
+            # Locate file in client directory
+            from pathlib import Path
+            import mimetypes
+            
+            # Assuming 'client' is sibling to 'server'
+            client_dir = Path(__file__).parent.parent / "client"
+            file_path = client_dir / path.lstrip('/')
+            
+            if file_path.exists() and file_path.is_file():
+                mime_type, _ = mimetypes.guess_type(file_path)
+                if not mime_type:
+                    mime_type = 'application/octet-stream'
+                
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                    
+                return (
+                    200,
+                    [
+                        ('Content-Type', mime_type),
+                        ('Content-Length', str(len(content))),
+                        ('Access-Control-Allow-Origin', '*')
+                    ],
+                    content
+                )
+            
+            return (404, [], b'404 Not Found')
+            
+        except Exception as e:
+            logger.error(f"Error serving HTTP request: {e}")
+            return (500, [], b'500 Internal Server Error')
     
     async def register_client(self, websocket: websockets.WebSocketServerProtocol):
         """Register a new client connection."""
@@ -45,20 +115,11 @@ class WebSocketServer:
         logger.info(f"Client disconnected: {websocket.remote_address}. Total clients: {len(self.clients)}")
     
     async def authenticate(self, websocket: websockets.WebSocketServerProtocol) -> bool:
-        """
-        Authenticate incoming WebSocket connection.
-        
-        Args:
-            websocket: WebSocket connection
-            
-        Returns:
-            True if authenticated, False otherwise
-        """
+        """Authenticate incoming WebSocket connection."""
         if not self.auth_token:
-            return True  # No authentication required
+            return True
         
         try:
-            # Wait for auth message
             message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
             data = json.loads(message)
             
@@ -68,88 +129,44 @@ class WebSocketServer:
             else:
                 await websocket.send(json.dumps({'type': 'auth_failed'}))
                 return False
-                
-        except asyncio.TimeoutError:
-            logger.warning(f"Authentication timeout for {websocket.remote_address}")
-            return False
-        except Exception as e:
-            logger.error(f"Authentication error: {e}")
+        except Exception:
             return False
     
     async def handler(self, websocket: websockets.WebSocketServerProtocol, path: str):
-        """
-        Handle incoming WebSocket connections.
-        
-        Args:
-            websocket: WebSocket connection
-            path: Request path
-        """
-        # Authenticate if required
+        """Handle incoming WebSocket connections."""
         if self.auth_token and not await self.authenticate(websocket):
             logger.warning(f"Authentication failed for {websocket.remote_address}")
-            await websocket.close(code=1008, reason="Authentication failed")
+            await websocket.close(code=1008)
             return
         
-        # Register client
         await self.register_client(websocket)
         
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
-                    # Binary audio data
-                    await self.handle_audio_data(message, websocket)
+                    # Binary audio data -> Forward to Wyoming
+                    # logger.debug(f"Received audio chunk: {len(message)} bytes") # Too noisy for prod, good for debug
+                    self.audio_buffer.add(message)
+                    await self.wyoming_server.send_audio(message)
                 else:
-                    # Text/JSON control message
                     await self.handle_control_message(message, websocket)
                     
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Connection closed: {websocket.remote_address}")
+            pass
         except Exception as e:
-            logger.error(f"Error in WebSocket handler: {e}", exc_info=True)
+            logger.error(f"Error in WebSocket handler: {e}")
         finally:
             await self.unregister_client(websocket)
     
-    async def handle_audio_data(self, data: bytes, websocket: websockets.WebSocketServerProtocol):
-        """
-        Process audio data from browser and forward to Wyoming.
-        
-        Args:
-            data: Raw audio bytes
-            websocket: Client WebSocket connection
-        """
-        # Buffer audio
-        self.audio_buffer.add(data)
-        
-        # Forward to Home Assistant via Wyoming
-        if self.wyoming_client.connected:
-            await self.wyoming_client.send_audio(data)
-        else:
-            logger.warning("Wyoming client not connected, audio data dropped")
-        
-        # Check for TTS response
-        tts_audio = await self.wyoming_client.get_tts_audio()
-        if tts_audio:
-            try:
-                await websocket.send(tts_audio)
-                logger.debug(f"Sent TTS audio to client: {len(tts_audio)} bytes")
-            except Exception as e:
-                logger.error(f"Failed to send TTS audio: {e}")
-    
     async def handle_control_message(self, message: str, websocket: websockets.WebSocketServerProtocol):
-        """
-        Process control/JSON messages from browser.
-        
-        Args:
-            message: JSON message string
-            websocket: Client WebSocket connection
-        """
+        """Process control/JSON messages from browser."""
         try:
             data = json.loads(message)
             msg_type = data.get('type')
             
             if msg_type == 'wake_detected':
                 logger.info("Wake word detected by client")
-                await self.wyoming_client.send_wake_word_detected()
+                await self.wyoming_server.send_wake_word_detected()
                 
             elif msg_type == 'ping':
                 await websocket.send(json.dumps({'type': 'pong'}))
@@ -157,34 +174,37 @@ class WebSocketServer:
             elif msg_type == 'status_request':
                 await websocket.send(json.dumps({
                     'type': 'status',
-                    'wyoming_connected': self.wyoming_client.connected,
                     'clients': len(self.clients),
-                    'buffered_bytes': self.audio_buffer.buffered_bytes
+                    'ha_connected': len(self.wyoming_server.ha_writers) > 0
                 }))
                 
-            else:
-                logger.warning(f"Unknown message type: {msg_type}")
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON message: {e}")
         except Exception as e:
-            logger.error(f"Error handling control message: {e}", exc_info=True)
-    
-    async def broadcast(self, message: str):
-        """
-        Broadcast message to all connected clients.
-        
-        Args:
-            message: Message to broadcast
-        """
+            logger.error(f"Error handling control message: {e}")
+            
+    async def broadcast_audio(self, audio_data: bytes):
+        """Broadcast audio received from HA (TTS) to all browser clients."""
         if self.clients:
+            # Send as binary
             await asyncio.gather(
-                *[client.send(message) for client in self.clients],
+                *[client.send(audio_data) for client in self.clients],
                 return_exceptions=True
             )
-    
-    async def serve(self):
-        """Start the WebSocket server."""
-        async with websockets.serve(self.handler, self.host, self.port):
-            logger.info(f"WebSocket server running on {self.host}:{self.port}")
-            await asyncio.Future()  # Run forever
+            logger.debug(f"Broadcasted TTS audio ({len(audio_data)} bytes) to {len(self.clients)} clients")
+
+
+
+    async def stop(self):
+        """Stop the WebSocket server."""
+        if hasattr(self, 'server') and self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        
+        # Close all active connections
+        if self.clients:
+            await asyncio.gather(
+                *[client.close() for client in self.clients],
+                return_exceptions=True
+            )
+            self.clients.clear()
+        
+        logger.info("WebSocket server stopped")

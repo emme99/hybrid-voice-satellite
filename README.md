@@ -2,6 +2,15 @@
 
 A browser-based voice satellite system that brings Home Assistant's voice control to any device with a web browser. Features local wake word detection and seamless integration with Home Assistant's Assist Pipeline.
 
+> [!WARNING]
+> **🚧 Work in Progress 🚧**
+> 
+> This project is currently in active development. Core functionality (Wake Word -> HA -> Audio Response) works, but audio quality tuning is ongoing.
+> 
+> **Known Issues:**
+> - TTS Audio playback may be distorted (pitch/speed issues) due to sample rate mismatches (Client 16kHz vs Server 22/24kHz).
+> - Work is underway to implement server-side `ffmpeg` conversion for consistent audio quality.
+
 ## 🎯 Features
 
 - **Browser-Based Voice Control**: Turn any device into a voice satellite using just a web browser

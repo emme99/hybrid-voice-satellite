@@ -9,22 +9,11 @@ import signal
 import sys
 from pathlib import Path
 from websocket_server import WebSocketServer
-from wyoming_client import WyomingClient
+from wyoming_server import WyomingServer
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
-    """
-    Load configuration from YAML file.
-    
-    Args:
-        config_path: Path to config file
-        
-    Returns:
-        Configuration dictionary
-    """
     config_file = Path(config_path)
-    
-    # Try example config if main config doesn't exist
     if not config_file.exists():
         example_config = Path("config.example.yaml")
         if example_config.exists():
@@ -39,12 +28,6 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 
 def setup_logging(config: dict):
-    """
-    Setup logging configuration.
-    
-    Args:
-        config: Configuration dictionary
-    """
     log_level = config.get('logging', {}).get('level', 'INFO')
     log_file = config.get('logging', {}).get('file')
     
@@ -60,53 +43,65 @@ def setup_logging(config: dict):
 
 async def main():
     """Main application entry point."""
-    # Load configuration
     config = load_config()
     setup_logging(config)
     
     logger = logging.getLogger(__name__)
     logger.info("Starting Hybrid Voice Satellite Server")
     
-    # Extract configuration
     server_config = config.get('server', {})
-    ha_config = config.get('home_assistant', {})
+    wyoming_config = config.get('wyoming', {})
     
-    # Initialize Wyoming client
-    wyoming = WyomingClient(
-        host=ha_config.get('host', 'homeassistant.local'),
-        port=ha_config.get('port', 10700)
+    # Initialize Wyoming Server (Listens for HA)
+    wyoming = WyomingServer(
+        host=wyoming_config.get('host', '0.0.0.0'),
+        port=wyoming_config.get('port', 10700)
     )
     
-    # Initialize WebSocket server
+    # Initialize WebSocket server (Listens for Browsers)
+    # Check for SSL certificates in client directory
+    ssl_context = None
+    # Use absolute path relative to this script
+    current_dir = Path(__file__).parent.resolve()
+    client_dir = current_dir.parent / "client"
+    cert_file = client_dir / "cert.pem"
+    key_file = client_dir / "key.pem"
+    
+    if cert_file.exists() and key_file.exists():
+        import ssl
+        logger.info(f"Loading SSL certificates from {cert_file}")
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(cert_file, key_file)
+    else:
+        logger.warning("No SSL certificates found. WebSocket will run in insecure mode (ws://)")
+        
     ws_server = WebSocketServer(
         host=server_config.get('host', '0.0.0.0'),
         port=server_config.get('port', 8765),
-        wyoming_client=wyoming,
-        auth_token=server_config.get('auth_token')
+        wyoming_server=wyoming,
+        auth_token=server_config.get('auth_token'),
+        ssl_context=ssl_context
     )
     
     # Shutdown handler
     shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
     
-    def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}, shutting down...")
+    def signal_handler():
+        logger.info("Received shutdown signal")
         shutdown_event.set()
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
     
     try:
-        # Connect to Home Assistant
-        logger.info(f"Connecting to Home Assistant at {ha_config.get('host')}:{ha_config.get('port')}")
-        await wyoming.connect()
-        
         # Start servers
-        logger.info("Starting WebSocket server and Wyoming keep-alive")
-        await asyncio.gather(
-            ws_server.serve(),
-            wyoming.keep_alive(),
-            shutdown_event.wait()
-        )
+        logger.info(f"Starting services...")
+        await wyoming.start()
+        await ws_server.start()
+        
+        # Wait for shutdown signal
+        await shutdown_event.wait()
         
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
@@ -114,7 +109,8 @@ async def main():
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
         logger.info("Shutting down...")
-        await wyoming.disconnect()
+        await ws_server.stop()
+        await wyoming.stop()
         logger.info("Shutdown complete")
 
 

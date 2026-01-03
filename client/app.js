@@ -5,10 +5,13 @@
 
 // Configuration
 const CONFIG = {
-    wsUrl: localStorage.getItem('wsUrl') || 'ws://localhost:8765',
-    wakeWord: localStorage.getItem('wakeWord') || 'ok_nabu',
-    authToken: localStorage.getItem('authToken') || '',
+    // Dynamically determine WebSocket URL based on current location
+    wsUrl: localStorage.getItem('wsUrl') || 
+           ((window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host),
+    wakeWord: localStorage.getItem('wakeWord') || 'alexa_v0.1',
+    authToken: localStorage.getItem('authToken') || 'change-me-in-production',
     sampleRate: 16000,
+    ttsSampleRate: 22050,
     channels: 1
 };
 
@@ -21,7 +24,17 @@ const STATE = {
     isActive: false,
     isListening: false,
     reconnectAttempts: 0,
-    maxReconnectAttempts: 5
+    maxReconnectAttempts: 5,
+    onnxSessions: {
+        mel: null,
+        embedding: null,
+        wakeWord: null
+    },
+    buffers: {
+        mel: [], // Grows/splices dynamically
+        emb: new Array(16).fill(0).map(() => new Float32Array(96).fill(0)) // Fixed ring buffer
+    },
+    lastError: null
 };
 
 // DOM Elements
@@ -148,10 +161,20 @@ async function deactivate() {
  */
 async function initAudioContext() {
     if (!STATE.audioContext) {
-        STATE.audioContext = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: CONFIG.sampleRate
-        });
-        log('Audio context initialized', 'info');
+        STATE.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+        log(`Audio context initialized at ${STATE.audioContext.sampleRate}Hz`, 'info');
+        
+        if (STATE.audioContext.sampleRate !== 16000) {
+             const msg = `Sample rate is ${STATE.audioContext.sampleRate}Hz. Resampling will be active.`;
+             log(msg, 'warning');
+             console.warn(msg);
+        }
+        console.log(`[DEBUG] AudioContext sample rate: ${STATE.audioContext.sampleRate} Hz`);
+        
+        if (STATE.audioContext.sampleRate !== 16000) {
+             console.warn(`[WARNING] AudioContext is running at ${STATE.audioContext.sampleRate}Hz instead of 16000Hz. Detection will degrade.`);
+        }
     }
     
     if (STATE.audioContext.state === 'suspended') {
@@ -292,66 +315,143 @@ async function requestMicrophone() {
 /**
  * Setup audio processing for wake word detection
  */
+/**
+ * Setup audio processing for wake word detection
+ */
 async function setupAudioProcessing(source) {
-    // For now, create a simple script processor
-    // TODO: Implement proper AudioWorklet with wake word detection
-    
-    const processor = STATE.audioContext.createScriptProcessor(4096, 1, 1);
-    
-    processor.onaudioprocess = (event) => {
-        if (!STATE.isActive || !STATE.ws || STATE.ws.readyState !== WebSocket.OPEN) {
-            return;
-        }
+    try {
+        await STATE.audioContext.audioWorklet.addModule('wake-word-processor.js');
+        const workletNode = new AudioWorkletNode(STATE.audioContext, 'wake-word-processor');
         
-        // Get audio data
-        const inputData = event.inputBuffer.getChannelData(0);
+        workletNode.port.onmessage = async (event) => {
+            const float32Data = event.data;
+            
+            // 1. Run Wake Word Inference
+            if (!STATE.isListening) {
+                await runWakeWordInference(float32Data);
+            }
+            
+            // 2. Stream to Server if Listening
+            if (STATE.isListening && STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
+                // Convert to Int16 for Wyoming
+                const int16Data = new Int16Array(float32Data.length);
+                for (let i = 0; i < float32Data.length; i++) {
+                    const s = Math.max(-1, Math.min(1, float32Data[i]));
+                    int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                STATE.ws.send(int16Data.buffer);
+            }
+        };
         
-        // Convert float32 to int16
-        const int16Data = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-            const s = Math.max(-1, Math.min(1, inputData[i]));
-            int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
+        source.connect(workletNode);
+        workletNode.connect(STATE.audioContext.destination);
+        STATE.audioWorkletNode = workletNode;
         
-        // Send to server (simplified - normally would only send after wake word)
-        if (STATE.isListening) {
-            STATE.ws.send(int16Data.buffer);
-        }
-    };
-    
-    source.connect(processor);
-    processor.connect(STATE.audioContext.destination);
-    
-    STATE.audioWorkletNode = processor;
-    
-    log('Audio processing configured', 'info');
+        log('Audio processing configured (AudioWorklet)', 'info');
+    } catch (e) {
+        log(`Failed to setup AudioWorklet: ${e.message}`, 'error');
+        // Fallback or re-throw
+        throw e;
+    }
 }
 
 /**
- * Load wake word model (placeholder)
+ * Run ONNX inference on audio chunk
  */
-async function loadWakeWordModel() {
-    // TODO: Implement ONNX Runtime Web wake word detection
-    // For now, simulate detection with a button
-    log(`Wake word model "${CONFIG.wakeWord}" loaded (simulated)`, 'info');
+/**
+ * Run ONNX inference on audio chunk
+ */
+async function runWakeWordInference(float32Data) {
+    if (!STATE.onnxSessions.mel || !STATE.onnxSessions.embedding || !STATE.onnxSessions.wakeWord) return;
     
-    // Simulate wake word detection for testing
-    document.addEventListener('keydown', (e) => {
-        if (e.key === ' ' && STATE.isActive) {
-            e.preventDefault();
-            simulateWakeWord();
+    try {
+        // --- 1. Melspectrogram ---
+        // Input: Audio chunk [1, 1280]
+        const melInputName = STATE.onnxSessions.mel.inputNames[0];
+        const audioTensor = new ort.Tensor('float32', Float32Array.from(float32Data), [1, float32Data.length]);
+        
+        const melResults = await STATE.onnxSessions.mel.run({ [melInputName]: audioTensor });
+        let melOutput = melResults[STATE.onnxSessions.mel.outputNames[0]].data;
+
+        // Normalization (critical step from voice-satellite-card)
+        // Note: data is a TypedArray, so we iterate to modify or map it
+        for (let j = 0; j < melOutput.length; j++) {
+            melOutput[j] = (melOutput[j] / 10.0) + 2.0;
         }
-    });
-    
-    log('Press SPACEBAR to simulate wake word detection', 'info');
+
+        // Split 160 features into 5 frames of 32
+        // openWakeWord produces 5 frames per 80ms chunk
+        for (let j = 0; j < 5; j++) {
+            const frame = melOutput.subarray(j * 32, (j + 1) * 32);
+            STATE.buffers.mel.push(new Float32Array(frame)); // Push copy
+        }
+
+        // Process while we have enough frames (sliding window)
+        // We use a while loop because one chunk might produce enough frames for an embedding
+        // but typically it's 1-to-1 after initial fill.
+        // Logic: accum 5 frames -> check if total >= 76
+        
+        while (STATE.buffers.mel.length >= 76) {
+             // Flatten Mel Buffer: [76, 32] -> [1, 76, 32, 1]
+             const flatMel = new Float32Array(76 * 32);
+             for (let i = 0; i < 76; i++) {
+                 flatMel.set(STATE.buffers.mel[i], i * 32);
+             }
+             
+             // --- 2. Embedding ---
+             const embInputName = STATE.onnxSessions.embedding.inputNames[0];
+             // Note: input shape is [1, 76, 32, 1] for newer/standard models
+             const melTensor = new ort.Tensor('float32', flatMel, [1, 76, 32, 1]);
+             
+             const embResults = await STATE.onnxSessions.embedding.run({ [embInputName]: melTensor });
+             const embOutput = embResults[STATE.onnxSessions.embedding.outputNames[0]].data;
+             
+             // --- 3. Accumulate Embeddings ---
+             STATE.buffers.emb.shift();
+             STATE.buffers.emb.push(new Float32Array(embOutput));
+             
+             // Flatten Embedding: [16, 96]
+             const flatEmb = new Float32Array(16 * 96);
+             for (let i = 0; i < 16; i++) {
+                 flatEmb.set(STATE.buffers.emb[i], i * 96);
+             }
+             
+             // --- 4. Wake Word ---
+             const item = STATE.onnxSessions.wakeWord; 
+             // Could be multiple models, here just one
+             const wwInputName = item.inputNames[0];
+             const embTensor = new ort.Tensor('float32', flatEmb, [1, 16, 96]);
+             
+             const wwResults = await item.run({ [wwInputName]: embTensor });
+             const probability = wwResults[item.outputNames[0]].data[0];
+             
+             // DEBUG: Log probability occasionally
+             if (Math.random() < 0.1) {
+                 console.log(`[DEBUG] Wake word probability: ${probability.toFixed(4)}`);
+             }
+
+             if (probability > 0.5) {
+                  log(`Wake word detected! (${(probability * 100).toFixed(1)}%)`, 'success');
+                  triggerWakeWord();
+                  // Cooldown handled by triggerWakeWord logic
+             }
+             
+             // Stride: Remove 8 frames from Mel buffer logic
+             // "This logic is from openWakeWord: hop size"
+             STATE.buffers.mel.splice(0, 8);
+        }
+
+    } catch (e) {
+        if (!STATE.lastError || STATE.lastError !== e.message) {
+            log(`Inference error: ${e.message}`, 'error');
+            console.error(e);
+            STATE.lastError = e.message;
+        }
+    }
 }
 
-/**
- * Simulate wake word detection (for testing)
- */
-function simulateWakeWord() {
+function triggerWakeWord() {
     if (!STATE.isListening) {
-        log('Wake word detected!', 'success');
         STATE.isListening = true;
         updateUI();
         
@@ -360,27 +460,103 @@ function simulateWakeWord() {
             STATE.ws.send(JSON.stringify({ type: 'wake_detected' }));
         }
         
-        // Stop listening after 5 seconds
-        setTimeout(() => {
-            STATE.isListening = false;
-            updateUI();
-            log('Listening timeout', 'info');
-        }, 5000);
+        // Stop listening after 5 seconds (or wait for silence event from server ideally)
+        // For now keep the timeout safety
+        STATE.silenceTimer = setTimeout(() => {
+            if (STATE.isListening) {
+                STATE.isListening = false;
+                updateUI();
+                log('Listening timeout', 'info');
+                
+                // Reset buffers to avoid state pollution from the gap
+                STATE.buffers.mel = [];
+                STATE.buffers.emb = new Array(16).fill(0).map(() => new Float32Array(96).fill(0));
+            }
+        }, 8000);
     }
 }
 
 /**
+ * Load wake word model (placeholder)
+ */
+/**
+ * Load wake word models
+ */
+async function loadWakeWordModel() {
+    try {
+        log('Loading ONNX models...', 'info');
+        
+        const modelPath = 'models';
+        const wakeWordId = CONFIG.wakeWord;
+        
+        // Load Melspectrogram model
+        log('Loading melspectrogram model...', 'info');
+        STATE.onnxSessions.mel = await ort.InferenceSession.create(`${modelPath}/melspectrogram.onnx`, { executionProviders: ['wasm'] });
+        
+        // Load Embedding model
+        log('Loading embedding model...', 'info');
+        STATE.onnxSessions.embedding = await ort.InferenceSession.create(`${modelPath}/embedding_model.onnx`, { executionProviders: ['wasm'] });
+        
+        // Load Wake Word model
+        log(`Loading wake word model: ${wakeWordId}...`, 'info');
+        STATE.onnxSessions.wakeWord = await ort.InferenceSession.create(`${modelPath}/${wakeWordId}.onnx`, { executionProviders: ['wasm'] });
+        
+        // Reset buffers
+        STATE.buffers.mel = [];
+        // Initialize embedding buffer with zero-filled arrays to match input shape [96]
+        STATE.buffers.emb = new Array(16).fill(0).map(() => new Float32Array(96).fill(0));
+        STATE.lastError = null;
+
+        log(`Models loaded successfully`, 'success');
+        
+    } catch (error) {
+        log(`Failed to load models: ${error.message}`, 'error');
+        throw error;
+    }
+}
+
+/**
+ * Simulate wake word detection (for testing)
+ */
+
+
+/**
  * Play audio response from server
+ */
+/**
+ * Play audio response from server (Raw PCM)
  */
 async function playAudioResponse(arrayBuffer) {
     try {
-        const audioBuffer = await STATE.audioContext.decodeAudioData(arrayBuffer);
-        const source = STATE.audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(STATE.audioContext.destination);
-        source.start();
+        // Assume 16-bit Mono PCM, 16000Hz (Wyoming standard for Rhasspy)
+        // If TTS is 22050Hz, we might need to adjust or read metadata
+        const int16Data = new Int16Array(arrayBuffer);
+        const float32Data = new Float32Array(int16Data.length);
         
-        log('Playing TTS response', 'info');
+        // Convert Int16 to Float32
+        for (let i = 0; i < int16Data.length; i++) {
+            float32Data[i] = int16Data[i] / 32768.0;
+        }
+        
+        // Create AudioBuffer
+        const buffer = STATE.audioContext.createBuffer(1, float32Data.length, CONFIG.ttsSampleRate);
+        buffer.getChannelData(0).set(float32Data);
+        
+        // Schedule playback
+        const source = STATE.audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(STATE.audioContext.destination);
+        
+        // Ensure continuous playback
+        const currentTime = STATE.audioContext.currentTime;
+        if (!STATE.nextAudioTime || STATE.nextAudioTime < currentTime) {
+            STATE.nextAudioTime = currentTime;
+        }
+        
+        source.start(STATE.nextAudioTime);
+        STATE.nextAudioTime += buffer.duration;
+        
+        // log('Playing TTS chunk', 'info'); // Too noisy
     } catch (error) {
         log(`Failed to play audio: ${error.message}`, 'error');
     }
@@ -434,6 +610,11 @@ function saveSettings() {
     localStorage.setItem('wsUrl', CONFIG.wsUrl);
     localStorage.setItem('wakeWord', CONFIG.wakeWord);
     localStorage.setItem('authToken', CONFIG.authToken);
+    
+    // Reload models if active
+    if (STATE.isActive) {
+        loadWakeWordModel().catch(console.error);
+    }
     
     log('Settings saved', 'success');
     toggleSettings();

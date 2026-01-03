@@ -3,9 +3,9 @@ server:
   port: 8765
   auth_token: "change-me-in-production"
 
-home_assistant:
-  host: "homeassistant.local"
-  port: 10700  # Wyoming protocol default port
+wyoming:
+  host: "0.0.0.0"
+  port: 10700  # Port to listen on (HA connects here)
 
 audio:
   sample_rate: 16000
