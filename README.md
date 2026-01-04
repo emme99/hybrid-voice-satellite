@@ -144,6 +144,11 @@ http:
   - Ensure you are not mixing HTTPS (Satellite) with HTTP (Home Assistant). Ideally, make them match, or use the HTTP setup above.
 
 
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
 ## Disclaimer
 
 ⚠️ **AI Generated Code**
