@@ -67,32 +67,44 @@ async def main():
     cert_file = client_dir / "cert.pem"
     key_file = client_dir / "key.pem"
     
-    if cert_file.exists() and key_file.exists():
+    ssl_enabled = server_config.get('ssl', True)
+    
+    if ssl_enabled and cert_file.exists() and key_file.exists():
         import ssl
         logger.info(f"Loading SSL certificates from {cert_file}")
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(cert_file, key_file)
     else:
-        logger.warning("No SSL certificates found. WebSocket will run in insecure mode (ws://)")
+        if not ssl_enabled:
+             logger.info("SSL disabled in configuration")
+        else:
+             logger.warning("No SSL certificates found. WebSocket will run in insecure mode (ws://)")
         
     ws_server = WebSocketServer(
         host=server_config.get('host', '0.0.0.0'),
         port=server_config.get('port', 8765),
         wyoming_server=wyoming,
         auth_token=server_config.get('auth_token'),
-        ssl_context=ssl_context
+        ssl_context=ssl_context,
+        client_config=config.get('client', {})
     )
     
     # Shutdown handler
     shutdown_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
     
-    def signal_handler():
+    # Simple signal handler that cancels the current task or sets event
+    # Note: asyncio.run() handles SIGINT by default by cancelling the main task,
+    # but we want a graceful shutdown sequence.
+    def signal_handler(sig, frame):
         logger.info("Received shutdown signal")
+        # Check if we are already shutting down
+        if shutdown_event.is_set():
+            logger.warning("Forced shutdown...")
+            sys.exit(1)
         shutdown_event.set()
-    
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
+        
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     try:
         # Start servers
@@ -100,17 +112,21 @@ async def main():
         await wyoming.start()
         await ws_server.start()
         
-        # Wait for shutdown signal
-        await shutdown_event.wait()
+        # Wait for shutdown event Loop
+        while not shutdown_event.is_set():
+             await asyncio.sleep(0.1)
         
-    except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt")
+    except asyncio.CancelledError:
+        logger.info("Main task cancelled")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
         logger.info("Shutting down...")
-        await ws_server.stop()
-        await wyoming.stop()
+        try:
+            await ws_server.stop()
+            await wyoming.stop()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
         logger.info("Shutdown complete")
 
 
@@ -118,4 +134,7 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nShutdown complete")
+        # This catch block is for the top-level interrupt
+        pass
+    except Exception as e:
+        print(f"Unexpected error: {e}")

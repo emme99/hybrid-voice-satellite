@@ -50,7 +50,7 @@ class WyomingServer:
     Accepts connections from Home Assistant.
     """
     
-    def __init__(self, host: str = "0.0.0.0", port: int = 10700, name: str = "hybrid-voice-satellite"):
+    def __init__(self, host: str = "0.0.0.0", port: int = 10700, name: str = "hybrid-voice-satellite-v2"):
         """
         Initialize Wyoming server.
         
@@ -137,7 +137,12 @@ class WyomingServer:
                 },
                 'installed': True,
                 'version': '0.1.0',
-                'capabilities': ['wake_word', 'audio_input', 'audio_output']
+                'capabilities': ['wake_word', 'audio_input', 'audio_output'],
+                'snd_format': {
+                    'rate': 22050,
+                    'width': 2,
+                    'channels': 1,
+                }
             }
             logger.debug(f"Sending handshake to {addr}: {handshake}")
             await self.send_json(writer, handshake)
@@ -281,19 +286,18 @@ class WyomingServer:
                         },
                         'installed': True,
                         'version': '0.1.0',
-                        'capabilities': ['wake_word', 'audio_input', 'audio_output']
+                        'components': [],
+                        'capabilities': ['wake_word', 'audio_input', 'audio_output'],
+                        'snd_format': {
+                            'rate': 22050,
+                            'width': 2,
+                            'channels': 1,
+                        }
                     }
                 }
             }
             logger.info(f"Sending info response: {handshake}")
             await self.send_json(writer, handshake)
-            
-        elif msg_type == 'audio-start':
-            # Start of TTS stream
-            data = message.get('data', {})
-            rate = data.get('rate', 22050)
-            width = data.get('width', 2)
-            channels = data.get('channels', 1)
             
         elif msg_type == 'audio-start':
             # Start of TTS stream
@@ -327,6 +331,9 @@ class WyomingServer:
             
             if hasattr(self, 'on_tts_stop'):
                 await self.on_tts_stop()
+                
+            # Signal playback finished to HA (Required for media player status)
+            await self.send_json(writer, {'type': 'played'})
     
         elif msg_type == 'run_pipeline':
             # HA requesting pipeline run (might not be needed if we drive it)

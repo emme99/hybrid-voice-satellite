@@ -10,6 +10,7 @@ const CONFIG = {
            ((window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host),
     wakeWord: localStorage.getItem('wakeWord') || 'alexa_v0.1',
     authToken: localStorage.getItem('authToken') || 'change-me-in-production',
+    overlayUrl: localStorage.getItem('overlayUrl') || '',
     sampleRate: 16000,
     ttsSampleRate: 22050,
     channels: 1
@@ -52,7 +53,15 @@ const elements = {
     debugLog: document.getElementById('debug-log'),
     wsUrlInput: document.getElementById('ws-url'),
     wakeWordSelect: document.getElementById('wake-word-select'),
-    authTokenInput: document.getElementById('auth-token')
+    wakeWordSelect: document.getElementById('wake-word-select'),
+    wakeWordSelect: document.getElementById('wake-word-select'),
+    authTokenInput: document.getElementById('auth-token'),
+    overlayUrlInput: document.getElementById('overlay-url-input'),
+    // Overlay specific
+    iframe: document.getElementById('overlay-iframe'),
+    activateFab: document.getElementById('activate-fab'),
+    fabVisualizer: document.getElementById('fab-visualizer'),
+    connectionStatus: document.getElementById('connection-status')
 };
 
 /**
@@ -64,13 +73,32 @@ async function init() {
     // Load saved settings
     elements.wsUrlInput.value = CONFIG.wsUrl;
     elements.wakeWordSelect.value = CONFIG.wakeWord;
+    elements.wsUrlInput.value = CONFIG.wsUrl;
+    elements.wakeWordSelect.value = CONFIG.wakeWord;
     elements.authTokenInput.value = CONFIG.authToken;
+    if (elements.overlayUrlInput) elements.overlayUrlInput.value = CONFIG.overlayUrl;
+
+    // Set initial iframe URL if configured locally
+    if (CONFIG.overlayUrl && elements.iframe) {
+        elements.iframe.src = CONFIG.overlayUrl;
+        log(`Loaded local overlay URL: ${CONFIG.overlayUrl}`, 'info');
+    }
     
     // Setup event listeners
-    elements.activateBtn.addEventListener('click', toggleActivation);
-    elements.settingsBtn.addEventListener('click', toggleSettings);
-    elements.saveSettings.addEventListener('click', saveSettings);
-    elements.clearLogBtn.addEventListener('click', clearLog);
+    // Setup event listeners
+    if (elements.activateBtn) {
+        elements.activateBtn.addEventListener('click', toggleActivation);
+    }
+    if (elements.activateFab) {
+        elements.activateFab.addEventListener('click', toggleActivation);
+    }
+    
+    if (elements.settingsBtn) elements.settingsBtn.addEventListener('click', toggleSettings);
+    if (elements.saveSettings) elements.saveSettings.addEventListener('click', saveSettings);
+    if (elements.clearLogBtn) elements.clearLogBtn.addEventListener('click', clearLog);
+    
+    // Auto-connect to WebSocket for config/status
+    connectWebSocket().catch(err => log(`Auto-connect failed: ${err.message}`, 'warning'));
     
     log('Application initialized', 'success');
 }
@@ -96,8 +124,10 @@ async function activate() {
         // Initialize Audio Context
         await initAudioContext();
         
-        // Connect to WebSocket server
-        await connectWebSocket();
+        // Ensure WebSocket is connected
+        if (!STATE.ws || STATE.ws.readyState !== WebSocket.OPEN) {
+             await connectWebSocket();
+        }
         
         // Request microphone access
         await requestMicrophone();
@@ -108,8 +138,13 @@ async function activate() {
         STATE.isActive = true;
         updateUI();
         
-        elements.activateBtn.innerHTML = '<span>Deactivate</span>';
-        elements.activateBtn.classList.add('active');
+        if (elements.activateBtn) {
+            elements.activateBtn.innerHTML = '<span>Deactivate</span>';
+            elements.activateBtn.classList.add('active');
+        }
+        if (elements.activateFab) {
+            elements.activateFab.classList.add('active');
+        }
         
         log('Voice control activated', 'success');
         
@@ -140,18 +175,25 @@ async function deactivate() {
         STATE.audioContext = null;
     }
     
-    if (STATE.ws) {
-        STATE.ws.close();
-        STATE.ws = null;
-    }
+    // Do not close WebSocket to keep config/overlay active
+    // if (STATE.ws) {
+    //    STATE.ws.close();
+    //    STATE.ws = null;
+    // }
     
     STATE.isActive = false;
     STATE.isListening = false;
     
     updateUI();
     
-    elements.activateBtn.innerHTML = '<span>Activate Voice Control</span>';
-    elements.activateBtn.classList.remove('active');
+    if (elements.activateBtn) {
+        elements.activateBtn.innerHTML = '<span>Activate Voice Control</span>';
+        elements.activateBtn.classList.remove('active');
+    }
+    if (elements.activateFab) {
+        elements.activateFab.classList.remove('active');
+        elements.activateFab.classList.remove('listening');
+    }
     
     log('Voice control deactivated', 'info');
 }
@@ -202,6 +244,9 @@ function connectWebSocket() {
                     token: CONFIG.authToken
                 }));
             }
+
+            // Request initial status and config
+            STATE.ws.send(JSON.stringify({ type: 'status_request' }));
             
             STATE.reconnectAttempts = 0;
             resolve();
@@ -269,17 +314,31 @@ function handleControlMessage(message) {
         case 'pong':
             // Keep-alive response
             break;
+            if (message.rate) {
+                STATE.currentTtsRate = message.rate;
+                log(`TTS Sample Rate set to ${message.rate}Hz`, 'info');
+            }
+            break;
         case 'status':
             updateStatus('wyoming-status', 
                 message.wyoming_connected ? 'connected' : 'disconnected',
                 message.wyoming_connected ? 'Connected' : 'Disconnected'
             );
             log(`Server status: ${message.clients} clients connected`, 'info');
-            break;
-        case 'audio_start':
-            if (message.rate) {
-                STATE.currentTtsRate = message.rate;
-                log(`TTS Sample Rate set to ${message.rate}Hz`, 'info');
+            
+            
+            // Handle Config if present (Overlay URL)
+            // Priority: Local Config > Server Config
+            const targetUrl = CONFIG.overlayUrl || (message.config && message.config.overlay_url);
+            
+            if (targetUrl && elements.iframe) {
+                // Only set if different to avoid reload
+                // If local config is set, we might have already set it in init(), but check anyway
+                const currentSrc = elements.iframe.getAttribute('src'); // Use getAttribute to avoid fully qualified URL issues if needed
+                if (elements.iframe.src !== targetUrl && elements.iframe.src === 'about:blank') {
+                    elements.iframe.src = targetUrl;
+                    log(`Loaded overlay URL: ${targetUrl}`, 'info');
+                }
             }
             break;
         default:
@@ -595,19 +654,46 @@ async function playAudioResponse(arrayBuffer) {
  */
 function updateUI() {
     if (STATE.isListening) {
-        elements.micVisualizer.classList.remove('active');
-        elements.micVisualizer.classList.add('listening');
-        elements.stateText.textContent = 'Listening...';
-        elements.stateText.className = 'state-text listening';
+        if (elements.micVisualizer) {
+            elements.micVisualizer.classList.remove('active');
+            elements.micVisualizer.classList.add('listening');
+        }
+        if (elements.stateText) {
+            elements.stateText.textContent = 'Listening...';
+            elements.stateText.className = 'state-text listening';
+        }
+        if (elements.activateFab) {
+            elements.activateFab.classList.add('listening');
+        }
+        if (elements.fabVisualizer) elements.fabVisualizer.classList.remove('hidden');
+        
     } else if (STATE.isActive) {
-        elements.micVisualizer.classList.add('active');
-        elements.micVisualizer.classList.remove('listening');
-        elements.stateText.textContent = 'Ready (Press SPACE)';
-        elements.stateText.className = 'state-text active';
+        if (elements.micVisualizer) {
+            elements.micVisualizer.classList.add('active');
+            elements.micVisualizer.classList.remove('listening');
+        }
+        if (elements.stateText) {
+            elements.stateText.textContent = 'Ready (Press SPACE)';
+            elements.stateText.className = 'state-text active';
+        }
+        if (elements.activateFab) {
+            elements.activateFab.classList.remove('listening');
+            elements.activateFab.classList.add('active');
+        }
+        if (elements.fabVisualizer) elements.fabVisualizer.classList.add('hidden');
+        
     } else {
-        elements.micVisualizer.classList.remove('active', 'listening');
-        elements.stateText.textContent = 'Click to activate';
-        elements.stateText.className = 'state-text';
+        if (elements.micVisualizer) {
+            elements.micVisualizer.classList.remove('active', 'listening');
+        }
+        if (elements.stateText) {
+            elements.stateText.textContent = 'Click to activate';
+            elements.stateText.className = 'state-text';
+        }
+        if (elements.activateFab) {
+            elements.activateFab.classList.remove('active', 'listening');
+        }
+        if (elements.fabVisualizer) elements.fabVisualizer.classList.add('hidden');
     }
 }
 
@@ -616,8 +702,15 @@ function updateUI() {
  */
 function updateStatus(elementId, status, text) {
     const element = document.getElementById(elementId);
-    element.className = `status-badge ${status}`;
-    element.textContent = text;
+    if (element) {
+        element.className = `status-badge ${status}`;
+        element.textContent = text;
+    }
+    
+    // Update FAB connection dot if it exists
+    if (elements.connectionStatus && elementId === 'ws-status') {
+        elements.connectionStatus.className = `status-dot ${status}`;
+    }
 }
 
 /**
@@ -633,11 +726,20 @@ function toggleSettings() {
 function saveSettings() {
     CONFIG.wsUrl = elements.wsUrlInput.value;
     CONFIG.wakeWord = elements.wakeWordSelect.value;
+    CONFIG.wsUrl = elements.wsUrlInput.value;
+    CONFIG.wakeWord = elements.wakeWordSelect.value;
     CONFIG.authToken = elements.authTokenInput.value;
+    if (elements.overlayUrlInput) CONFIG.overlayUrl = elements.overlayUrlInput.value;
     
     localStorage.setItem('wsUrl', CONFIG.wsUrl);
     localStorage.setItem('wakeWord', CONFIG.wakeWord);
     localStorage.setItem('authToken', CONFIG.authToken);
+    if (elements.overlayUrlInput) localStorage.setItem('overlayUrl', CONFIG.overlayUrl);
+    
+    // Apply Overlay URL immediately if changed
+    if (CONFIG.overlayUrl && elements.iframe && elements.iframe.src !== CONFIG.overlayUrl) {
+        elements.iframe.src = CONFIG.overlayUrl;
+    }
     
     // Reload models if active
     if (STATE.isActive) {

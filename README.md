@@ -90,6 +90,10 @@ Open your browser and navigate to:
 ## Troubleshooting
 
 - **No Audio / Microphone Error**: Ensure you are using **HTTPS**. Browsers block mic access on insecure HTTP (except localhost).
+  - **Pro Tip**: To test on HTTP without SSL (e.g., if you want to use iframes that block mixed content), go to `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, enable it, and add your server's URL (e.g., `http://192.168.1.100:8765`).
+- **Overlay Mode**:
+  - Open `https://localhost:8765/overlay.html` for a dedicated voice interface.
+  - You can configure the dashboard URL directly in the settings (⚙️) on that page.
 - **"Demon Voice" (Slow Audio)**: Fixed! The client automatically handles sample rate conversion.
 - **Connection Error**: Check `server/config.yaml` and ensure port 8765 is open.
 

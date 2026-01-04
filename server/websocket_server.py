@@ -17,7 +17,7 @@ class WebSocketServer:
     WebSocket server handling browser connections and audio streaming.
     """
     
-    def __init__(self, host: str, port: int, wyoming_server: WyomingServer, auth_token: str = None, ssl_context=None):
+    def __init__(self, host: str, port: int, wyoming_server: WyomingServer, auth_token: str = None, ssl_context=None, client_config: dict = None):
         """
         Initialize WebSocket server.
         
@@ -32,6 +32,7 @@ class WebSocketServer:
         self.port = port
         self.wyoming_server = wyoming_server
         self.auth_token = auth_token
+        self.client_config = client_config or {}
         self.ssl_context = ssl_context
         self.clients: Set[websockets.WebSocketServerProtocol] = set()
         self.audio_buffer = AudioBuffer(sample_rate=16000)
@@ -179,7 +180,8 @@ class WebSocketServer:
                 await websocket.send(json.dumps({
                     'type': 'status',
                     'clients': len(self.clients),
-                    'ha_connected': len(self.wyoming_server.ha_writers) > 0
+                    'ha_connected': len(self.wyoming_server.ha_writers) > 0,
+                    'config': self.client_config
                 }))
                 
         except Exception as e:
