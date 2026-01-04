@@ -59,15 +59,14 @@ echo "🔒 HTTPS Setup"
 echo "For microphone access, the client must be served over HTTPS."
 echo
 
-if [ ! -d "nginx/ssl" ]; then
+if [ ! -f "client/cert.pem" ]; then
     echo "Would you like to generate self-signed certificates for testing? (yes/no)"
     read -r response
     if [ "$response" = "yes" ]; then
-        mkdir -p nginx/ssl
-        openssl req -x509 -newkey rsa:4096 -keyout nginx/ssl/key.pem \
-            -out nginx/ssl/cert.pem -days 365 -nodes \
+        openssl req -x509 -newkey rsa:4096 -keyout client/key.pem \
+            -out client/cert.pem -days 365 -nodes \
             -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
-        echo "✓ Self-signed certificates created"
+        echo "✓ Self-signed certificates created in client/ directory"
     fi
 fi
 

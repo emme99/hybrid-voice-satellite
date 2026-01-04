@@ -12,6 +12,37 @@ logger = logging.getLogger(__name__)
 
 import wave
 import datetime
+import numpy as np
+from scipy import signal
+
+def resample_audio(audio_bytes: bytes, orig_rate: int = 22050, target_rate: int = 16000) -> bytes:
+    """Resample audio bytes from orig_rate to target_rate using polyphase filtering."""
+    try:
+        if not audio_bytes:
+            return b""
+        
+        # Convert bytes to numpy array (assume int16)
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+        
+        # Calculate resampling factors (up/down)
+        # 16000/22050 ~ 320/441
+        # We can implement a simple GCD reducer or just pass them raw, scipy handles it but efficient is better
+        gcd = np.gcd(orig_rate, target_rate)
+        up = int(target_rate // gcd)
+        down = int(orig_rate // gcd)
+        
+        # Resample using polyphase filter (better for audio than FFT resample)
+        # Cast to float32 for processing to avoid overflow during filtering
+        audio_float = audio_array.astype(np.float32)
+        resampled_float = signal.resample_poly(audio_float, up, down)
+        
+        # Clip to int16 range and convert back
+        resampled_clipped = np.clip(resampled_float, -32768, 32767)
+        return resampled_clipped.astype(np.int16).tobytes()
+        
+    except Exception as e:
+        logger.error(f"Resampling failed: {e}")
+        return audio_bytes
 
 class WyomingServer:
     """
@@ -35,6 +66,8 @@ class WyomingServer:
         self.ha_writers: Set[asyncio.StreamWriter] = set()
         self.client_tasks: Set[asyncio.Task] = set()
         self.debug_wav = None
+        self.pending_tts_audio = bytearray()
+        self.tts_sample_rate = 22050 # Default, will update from audio-start
     
     async def start(self):
         """Start the Wyoming TCP server."""
@@ -112,7 +145,11 @@ class WyomingServer:
             # Message loop
             pending_data = None
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except ConnectionResetError:
+                    break
+                    
                 if not line:
                     logger.info(f"Connection closed by {addr} (EOF)")
                     break
@@ -122,10 +159,6 @@ class WyomingServer:
                     decoded_line = line.decode('utf-8', errors='ignore').strip()
                     if not decoded_line:
                         continue
-                     
-                    # Hack: Handle concatenated JSON objects {data}{header} sent by some clients
-                    if '}{' in decoded_line:
-                         decoded_line = decoded_line.replace('}{', '} {')
                         
                     decoder = json.JSONDecoder(strict=False)
                     pos = 0
@@ -143,9 +176,6 @@ class WyomingServer:
                             if next_brace == -1:
                                 logger.debug(f"No JSON object found in remaining text: {repr(decoded_line[pos:])}")
                                 break
-                            
-                            # Found a brace, skip garbage
-                            # logger.warning(f"Skipped {next_brace - pos} bytes of garbage. Resuming at {next_brace}")
                             pos = next_brace
                             
                         # Parse JSON object
@@ -153,8 +183,7 @@ class WyomingServer:
                             message, idx = decoder.raw_decode(decoded_line, pos)
                             pos = idx
                         except json.JSONDecodeError:
-                            # The '{' we found might be part of binary garbage. 
-                            # Skip it and continue searching.
+                            # The '{' we found might be part of binary garbage or incomplete.
                             pos += 1
                             continue
                         
@@ -162,36 +191,35 @@ class WyomingServer:
                             logger.warning(f"Ignored non-dict message: {message}")
                             continue
 
-                        # Handle detached data (message without type)
-                        if not message.get('type'):
-                            # This is likely the 'data' payload for the next event
-                            pending_data = message
-                            continue
-
-                        # If we have pending data and this message expects it
-                        if pending_data and message.get('data_length'):
-                            message['data'] = pending_data
-                            pending_data = None
-                        elif pending_data:
-                             if not message.get('data'):
-                                 message['data'] = pending_data
-                             pending_data = None
-
-                        logger.debug(f"Parsed message: {message.get('type')}")
+                        # logger.debug(f"Parsed message: {message.get('type')}")
                         
-                        # Check for binary payload
+                        # 1. Check for data (JSON metadata)
+                        data_length = message.get('data_length')
+                        if data_length:
+                             try:
+                                 data_bytes = await reader.readexactly(data_length)
+                                 data_obj = json.loads(data_bytes)
+                                 # Merge into message['data']
+                                 if 'data' not in message:
+                                     message['data'] = {}
+                                 if isinstance(data_obj, dict):
+                                     message['data'].update(data_obj)
+                             except asyncio.IncompleteReadError:
+                                 logger.error(f"Incomplete data read from {addr}")
+                                 return # Close connection
+                             except json.JSONDecodeError:
+                                 logger.error(f"Invalid JSON data block from {addr}")
+                                 return # Close connection
+
+                        # 2. Check for binary payload (Audio)
                         payload = None
                         payload_length = message.get('payload_length')
                         if payload_length:
-                            logger.debug(f"Message expects {payload_length} bytes payload. Reading...")
                             try:
                                 payload = await reader.readexactly(payload_length)
-                                logger.debug(f"Read {len(payload)} bytes payload.")
                             except asyncio.IncompleteReadError:
                                 logger.error(f"Incomplete payload read from {addr}")
-                                return # Break outer loop
-                        else:
-                            logger.debug("No payload_length in message.")
+                                return # Close connection
                         
                         await self.handle_message(message, payload, writer)
 
@@ -260,17 +288,45 @@ class WyomingServer:
             logger.info(f"Sending info response: {handshake}")
             await self.send_json(writer, handshake)
             
+        elif msg_type == 'audio-start':
+            # Start of TTS stream
+            data = message.get('data', {})
+            rate = data.get('rate', 22050)
+            width = data.get('width', 2)
+            channels = data.get('channels', 1)
+            
+        elif msg_type == 'audio-start':
+            # Start of TTS stream
+            data = message.get('data', {})
+            rate = data.get('rate', 22050)
+            width = data.get('width', 2)
+            channels = data.get('channels', 1)
+            
+            logger.info(f"TTS Stream started. Format: {rate}Hz, {width} bytes/sample, {channels} ch")
+            
+            # Notify handler (e.g. WebSocket server) to prepare client
+            if hasattr(self, 'on_tts_start'):
+                await self.on_tts_start(rate)
+
         elif msg_type in ('audio', 'audio-chunk'):
             # TTS Audio chunk received
-            # Prefer binary payload, fallback to hex data
             audio_bytes = payload
             if not audio_bytes:
                 data_hex = message.get('data')
                 if data_hex:
                     audio_bytes = bytes.fromhex(data_hex)
             
-            if audio_bytes and hasattr(self, 'on_tts_audio'):
-                await self.on_tts_audio(audio_bytes)
+            if audio_bytes:
+                if hasattr(self, 'on_tts_audio'):
+                    # Pass-through: Send raw bytes to client immediately
+                    await self.on_tts_audio(audio_bytes)
+
+        elif msg_type == 'audio-stop':
+            # End of TTS stream
+            logger.info("TTS Stream ended.")
+            
+            if hasattr(self, 'on_tts_stop'):
+                await self.on_tts_stop()
     
         elif msg_type == 'run_pipeline':
             # HA requesting pipeline run (might not be needed if we drive it)
@@ -281,13 +337,6 @@ class WyomingServer:
         if not self.ha_writers:
             return
         
-        # DEBUG: Write to WAV file if open
-        if self.debug_wav:
-             try:
-                 self.debug_wav.writeframes(audio_data)
-             except Exception as e:
-                 logger.error(f"Failed to write to debug wav: {e}")
-
         message = {
             'type': 'audio-chunk',
             'data': {
@@ -313,25 +362,6 @@ class WyomingServer:
     async def send_wake_word_detected(self):
         """Notify HA to start a pipeline."""
         
-        # DEBUG: Start new recording session
-        if self.debug_wav:
-             try:
-                 self.debug_wav.close()
-             except:
-                 pass
-        
-        try:
-             import datetime
-             filename = f"debug_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-             self.debug_wav = wave.open(filename, 'wb')
-             self.debug_wav.setnchannels(1)
-             self.debug_wav.setsampwidth(2) # 16-bit
-             self.debug_wav.setframerate(16000)
-             logger.info(f"Started recording debug audio to {filename}")
-        except Exception as e:
-             logger.error(f"Failed to start debug wav: {e}")
-             self.debug_wav = None
-
         # 1. Start Pipeline
         # We start the pipeline at the 'stt' stage since we already did wake word
         pipeline_message = {

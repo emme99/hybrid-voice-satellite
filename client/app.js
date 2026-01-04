@@ -276,10 +276,17 @@ function handleControlMessage(message) {
             );
             log(`Server status: ${message.clients} clients connected`, 'info');
             break;
+        case 'audio_start':
+            if (message.rate) {
+                STATE.currentTtsRate = message.rate;
+                log(`TTS Sample Rate set to ${message.rate}Hz`, 'info');
+            }
+            break;
         default:
             log(`Unknown message type: ${message.type}`, 'warning');
     }
 }
+
 
 /**
  * Request microphone access
@@ -527,7 +534,27 @@ async function loadWakeWordModel() {
  * Play audio response from server (Raw PCM)
  */
 async function playAudioResponse(arrayBuffer) {
+    if (!STATE.audioContext) {
+        if (STATE.isActive) {
+             console.warn('AudioContext lost but state is active. Re-initializing...');
+             await initAudioContext();
+        } else {
+             // Ignore audio if not active
+             return;
+        }
+    }
+
     try {
+        // Detect and skip WAV header (RIFF) to avoid static burst
+        // RIFF = 0x52 0x49 0x46 0x46
+        if (arrayBuffer.byteLength > 44) {
+            const headerView = new DataView(arrayBuffer);
+            if (headerView.getUint32(0, false) === 0x52494646) {
+                log('Detected WAV header in stream. Skipping 44 bytes.', 'warning');
+                arrayBuffer = arrayBuffer.slice(44);
+            }
+        }
+
         // Assume 16-bit Mono PCM, 16000Hz (Wyoming standard for Rhasspy)
         // If TTS is 22050Hz, we might need to adjust or read metadata
         const int16Data = new Int16Array(arrayBuffer);
@@ -539,7 +566,8 @@ async function playAudioResponse(arrayBuffer) {
         }
         
         // Create AudioBuffer
-        const buffer = STATE.audioContext.createBuffer(1, float32Data.length, CONFIG.ttsSampleRate);
+        const rate = STATE.currentTtsRate || CONFIG.ttsSampleRate || 22050; // Use detected rate or fallback
+        const buffer = STATE.audioContext.createBuffer(1, float32Data.length, rate);
         buffer.getChannelData(0).set(float32Data);
         
         // Schedule playback

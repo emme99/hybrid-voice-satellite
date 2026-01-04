@@ -36,8 +36,9 @@ class WebSocketServer:
         self.clients: Set[websockets.WebSocketServerProtocol] = set()
         self.audio_buffer = AudioBuffer(sample_rate=16000)
         
-        # Register TTS callback
+        # Register TTS callbacks
         self.wyoming_server.on_tts_audio = self.broadcast_audio
+        self.wyoming_server.on_tts_start = self.broadcast_audio_start
     
     async def start(self):
         """Start the WebSocket server."""
@@ -63,6 +64,9 @@ class WebSocketServer:
             
             if path == '/':
                 path = '/index.html'
+            
+            # Strip query string if present
+            path = path.split('?')[0]
             
             # Allow WebSocket upgrades to pass through
             if "Upgrade" in request_headers and request_headers["Upgrade"].lower() == "websocket":
@@ -181,6 +185,19 @@ class WebSocketServer:
         except Exception as e:
             logger.error(f"Error handling control message: {e}")
             
+    async def broadcast_audio_start(self, rate: int):
+        """Notify clients of incoming TTS stream format."""
+        if self.clients:
+            message = json.dumps({
+                'type': 'audio_start',
+                'rate': rate
+            })
+            await asyncio.gather(
+                *[client.send(message) for client in self.clients],
+                return_exceptions=True
+            )
+            logger.debug(f"Broadcasted audio_start (rate={rate}) to {len(self.clients)} clients")
+
     async def broadcast_audio(self, audio_data: bytes):
         """Broadcast audio received from HA (TTS) to all browser clients."""
         if self.clients:
