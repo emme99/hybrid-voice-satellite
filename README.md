@@ -80,22 +80,69 @@ source venv/bin/activate
 python main.py
 ```
 
-### 5. Connect Client
+### 5. Client Interfaces
 
-Open your browser and navigate to:
-`https://localhost:8765` (or your server's IP).
+The satellite provides two interfaces:
 
-*Note: Since we use self-signed certificates, you'll see a security warning. Click "Advanced" -> "Proceed" to accept it.*
+#### 1. Inspector Dashboard (`/index.html`)
+- **URL**: `https://localhost:8765`
+- **Purpose**: Main control panel for monitoring and debugging.
+- **Features**:
+  - Live microphone visualizer.
+  - Connection status indicators (Wyoming, WebSocket, Mic).
+  - Wake Word selection.
+  - Debug logs.
+
+#### 2. Voice Overlay (`/overlay.html`)
+- **URL**: `https://localhost:8765/overlay.html`
+- **Purpose**: A minimalist floating interface designed to run on top of a Home Assistant dashboard.
+- **Features**:
+  - **Background Iframe**: Loads your Home Assistant dashboard (or any URL) in the background.
+  - **Floating Action Button (FAB)**: Tap to activate voice, or just say the wake word.
+  - **Settings (⚙️)**: Click the gear icon to configure the **Overlay URL** directly in the browser.
+
+---
+
+## Advanced Configuration: HTTP & Iframes
+
+If you want to embed Home Assistant in the overlay iframe without mixed-content warnings or security blocks, you may need to run the satellite in **HTTP mode** (no SSL) and adjust Home Assistant settings.
+
+### 1. Disable SSL on the Satellite
+Edit `server/config.yaml`:
+```yaml
+server:
+  ssl: false  # Disable HTTPS
+```
+*Note: Browsers normally block microphone access on insecure HTTP. See "Troubleshooting" below for the fix.*
+
+### 2. Configure Home Assistant for Iframes
+To allow Home Assistant to be displayed inside the satellite's iframe, add this to your Home Assistant `configuration.yaml`:
+
+```yaml
+http:
+  use_x_frame_options: false
+```
+*Restart Home Assistant after changing this setting.*
+
+---
 
 ## Troubleshooting
 
-- **No Audio / Microphone Error**: Ensure you are using **HTTPS**. Browsers block mic access on insecure HTTP (except localhost).
-  - **Pro Tip**: To test on HTTP without SSL (e.g., if you want to use iframes that block mixed content), go to `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, enable it, and add your server's URL (e.g., `http://192.168.1.100:8765`).
-- **Overlay Mode**:
-  - Open `https://localhost:8765/overlay.html` for a dedicated voice interface.
-  - You can configure the dashboard URL directly in the settings (⚙️) on that page.
-- **"Demon Voice" (Slow Audio)**: Fixed! The client automatically handles sample rate conversion.
-- **Connection Error**: Check `server/config.yaml` and ensure port 8765 is open.
+- **No Audio / Microphone Error**:
+  - **HTTPS**: Ensure you are using `https://` if SSL is enabled.
+  - **HTTP (No SSL)**: If using `http://`, Chrome will block the mic unless you add an exception:
+    1. Go to `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
+    2. Enable it.
+    3. Add your satellite URL (e.g., `http://192.168.1.100:8765`) to the list.
+    4. Relaunch Chrome.
+
+- **"Demon Voice" (Slow Audio)**:
+  - Fixed! The client automatically handles sample rate conversion.
+
+- **Iframe Refused to Connect**:
+  - Ensure `use_x_frame_options: false` is set in Home Assistant.
+  - Ensure you are not mixing HTTPS (Satellite) with HTTP (Home Assistant). Ideally, make them match, or use the HTTP setup above.
+
 
 ## Disclaimer
 
