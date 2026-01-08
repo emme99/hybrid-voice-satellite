@@ -1,3 +1,7 @@
+# This project is on standby because it has migrated to: https://github.com/emme99/hybrid-voice-assistant
+
+
+
 # Hybrid Voice Satellite 🛰️
 
 A zero-hardware **Voice Satellite** for Home Assistant that runs entirely in your browser, backed by a lightweight Python relay server.
